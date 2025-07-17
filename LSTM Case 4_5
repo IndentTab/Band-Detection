@@ -1,195 +1,144 @@
 import os
+import glob
 import torch
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
+from pathlib import Path
+from sklearn.metrics import roc_curve
+import matplotlib.pyplot as plt
 import torch.nn as nn
 import torch.optim as optim
-import matplotlib.pyplot as plt
-from pathlib import Path
-from sklearn.metrics import roc_curve, auc
+from torch.utils.data import DataLoader, Dataset
 
 # === Config ===
 DEVICE = torch.device("cpu")
 BATCH_SIZE = 64
 EPOCHS = 20
 
-# Case-specific SNR and data paths
-CASE4_PATH = Path(r"C:\Users\Srijita Saha\Collaborative learning\PartialObservation\RefinedNewData\SNRs\RandMod\250708_18_30")
-CASE5_PATH = Path(r"C:\Users\Srijita Saha\Collaborative learning\PartialObservation\RefinedNewData\SNRs\PUswitch\250708_16_12")
-#COMMON_SNR = -8
-
-# === Dataset ===
-class SyntheticPSDCaseDataset(torch.utils.data.Dataset):
+# Dataset
+class SyntheticPSDCaseDataset(Dataset):
     def __init__(self, data_list, label_list):
-        data = np.stack([np.array(x) for x in data_list])  # (N, 10, 1, 64, 20)
-        data = data.squeeze(2)                             # (N, 10, 64, 20)
-        N, SU, H, W = data.shape
-        data = data.reshape(N * SU, H, W)                  # (N * 10, 64, 20)
+        x = np.stack([np.array(d) for d in data_list])      # (N,10,1,64,20)
+        x = x.squeeze(2)                                   # (N,10,64,20)
+        N, SU, H, W = x.shape
+        x = x.reshape(N * SU, H, W)                        # (N*10,64,20)
+        y = np.repeat(np.array(label_list), repeats=10, axis=0)
 
-        labels = np.repeat(np.array(label_list), repeats=10, axis=0)  # (N * 10, 20)
-
-        self.X = torch.tensor(data, dtype=torch.float32)
-        self.Y = torch.tensor(labels, dtype=torch.float32)
-
+        self.X = torch.tensor(x, dtype=torch.float32)
+        self.Y = torch.tensor(y, dtype=torch.float32)
         self.X = (self.X - self.X.mean()) / self.X.std()
 
-    def __len__(self):
-        return len(self.X)
+    def __len__(self):  return len(self.X)
+    def __getitem__(self, i): return self.X[i], self.Y[i]
 
-    def __getitem__(self, idx):
-        return self.X[idx], self.Y[idx]
-# === Model ===
+# Model
 class LSTMDetector(nn.Module):
-    def __init__(self, input_size=64, hidden_size=128, num_layers=2, num_classes=20):
+    def __init__(self, num_classes=20):
         super().__init__()
-        self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size,
-                            num_layers=num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, num_classes)
-        self.sigmoid = nn.Sigmoid()
-
+        self.lstm = nn.LSTM(64, 128, 2, batch_first=True)
+        self.fc   = nn.Linear(128, num_classes)
+        self.sig  = nn.Sigmoid()
     def forward(self, x):
-        x = x.permute(0, 2, 1)  # (batch, 20, 64)
+        x = x.permute(0,2,1)             # (B,20,64)
         out, _ = self.lstm(x)
-        out = self.fc(out[:, -1, :])
-        return self.sigmoid(out)
-# === Evaluate PD at PFA = 5% ===
-def evaluate_pd(model, test_loader, pfa_threshold=0.05):
+        out    = self.fc(out[:,-1,:])
+        return self.sig(out)
+
+def evaluate_pd(model, loader, pfa=0.05):
     model.eval()
-    y_true, y_scores = [], []
+    ys, ps = [], []
     with torch.no_grad():
-        for xb, yb in test_loader:
+        for xb, yb in loader:
             xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-            preds = model(xb)
-            y_true.append(yb.cpu())
-            y_scores.append(preds.cpu())
-    y_true = torch.cat(y_true).numpy().ravel()
-    y_scores = torch.cat(y_scores).numpy().ravel()
+            ps.append(model(xb).cpu()); ys.append(yb.cpu())
+    ys = torch.cat(ys).numpy().ravel()
+    ps = torch.cat(ps).numpy().ravel()
+    fpr, tpr, _ = roc_curve(ys, ps)
+    idx = np.searchsorted(fpr, pfa, side="left")
+    pd  = tpr[idx] if idx < len(tpr) else 0.0
+    return pd, fpr, tpr   
 
-    fpr, tpr, thresholds = roc_curve(y_true, y_scores)
-    try:
-        pd_at_pfa = tpr[np.where(fpr >= pfa_threshold)[0][0]]
-    except IndexError:
-        pd_at_pfa = 0.0
-    return pd_at_pfa, fpr, tpr
+def train_one_file(case_name, pth_file):
+    db = torch.load(pth_file, map_location=DEVICE)
+    print(f"✅ loaded {pth_file.name}  train={len(db['training data list'])}  "
+          f"test={len(db['testing data list'])}")
 
-# === Training and Evaluation ===
-def train_and_evaluate(case_name, file_path):
-    db = torch.load(file_path, map_location=DEVICE)
-    train_data = db['training data list']
-    train_labels = db['training label list']
-    test_data = db['testing data list']
-    test_labels = db['testing label list']
-
-    train_loader = DataLoader(SyntheticPSDCaseDataset(train_data, train_labels), batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(SyntheticPSDCaseDataset(test_data, test_labels), batch_size=BATCH_SIZE)
+    tr_loader = DataLoader(SyntheticPSDCaseDataset(db['training data list'],
+                                                   db['training label list']),
+                           batch_size=BATCH_SIZE, shuffle=True)
+    te_loader = DataLoader(SyntheticPSDCaseDataset(db['testing data list'],
+                                                   db['testing label list']),
+                           batch_size=BATCH_SIZE)
 
     model = LSTMDetector().to(DEVICE)
-    loss_fn = nn.BCELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optim_ = optim.Adam(model.parameters(), lr=1e-3)
+    lossfn = nn.BCELoss()
 
-    for epoch in range(EPOCHS):
-        model.train()
-        total_loss = 0
-        for xb, yb in train_loader:
+    for ep in range(EPOCHS):
+        model.train(); tot = 0
+        for xb, yb in tr_loader:
             xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-            preds = model(xb)
-            loss = loss_fn(preds, yb)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item() * xb.size(0)
-        avg_loss = total_loss / len(train_loader.dataset)
-        print(f"{case_name} | Epoch {epoch+1:2d} | Loss: {avg_loss:.4f}")
+            loss   = lossfn(model(xb), yb)
+            optim_.zero_grad(); loss.backward(); optim_.step()
+            tot += loss.item()*xb.size(0)
+        if (ep+1)%5==0: print(f"{case_name} {pth_file.stem} ep{ep+1}/{EPOCHS} "
+                              f"loss={tot/len(tr_loader.dataset):.3f}")
 
-    pd, fpr, tpr = evaluate_pd(model, test_loader, pfa_threshold=0.05)
-
-    # Save model for ROC-8dB analysis
-    torch.save(model.state_dict(), f"lstm_{case_name.lower().replace(' ', '_')}_snr-8_model.pt")
+    pd, fpr, tpr = evaluate_pd(model, te_loader)
     return pd, fpr, tpr
 
-# === Run for Case 4 ===
-print("\n===== Running Case 4: Dynamic Modulation Type =====")
-#case4_file = CASE4_PATH / f"Data_SNR{COMMON_SNR}vol20.pth"
-#pd4, fpr4, tpr4 = train_and_evaluate("Case 4", case4_file)
+def run_case(case_dir, label):
+    pd_dict, fpr_dict, tpr_dict = {}, {}, {}
+    pths = sorted(glob.glob(str(case_dir/"Data_SNR*.pth")))
+    if not pths: print(f"❌ no files in {case_dir}"); return pd_dict, fpr_dict, tpr_dict
+    for p in pths:
+        p   = Path(p)                               # ← convert string ➜ Path
+        snr = int(p.stem.split("SNR")[1].split("vol")[0])   # e.g. -10
+        pd, fpr, tpr = train_one_file(label, p)
+        pd_dict[snr]  = pd
+        fpr_dict[snr] = fpr
+        tpr_dict[snr] = tpr
 
-# === Run for Case 5 ===
-print("\n===== Running Case 5: Varying Partial Observation =====")
-#case5_file = CASE5_PATH / f"Data_SNR{COMMON_SNR}vol1.pth"
-#pd5, fpr5, tpr5 = train_and_evaluate("Case 5", case5_file)
-CASE4_SNRS = [-16, -14, -12, -10, -8, -6, -4, -2]
-CASE5_SNRS = [-8]  # Add more if you generate more files later
+    return pd_dict, fpr_dict, tpr_dict
 
-pd4 = {}
-pd5 = {}
-fpr4 = {}
-tpr4 = {}
-fpr5 = {}
-tpr5 = {}
+print("\n=== Case 4 (Random Mod) ===")
+pd4, fpr4, tpr4 = run_case(CASE4_PATH, "Case4")
+print("\n=== Case 5 (PU Switch) ===")
+pd5, fpr5, tpr5 = run_case(CASE5_PATH, "Case5")
 
-print("\n===== Running Case 4: Dynamic Modulation Type =====")
-for snr in CASE4_SNRS:
-    path = CASE4_PATH / f"Data_SNR{snr}vol20.pth"
-    if not path.exists():
-        print(f"❌ File not found for Case 4 SNR={snr}dB")
-        continue
-    pd, fpr, tpr = train_and_evaluate("Case 4", path)
-    pd4[snr] = pd
-    fpr4[snr] = fpr
-    tpr4[snr] = tpr
+# --------  PD vs SNR plots  ----------
+plt.figure(figsize=(7,5))
+if pd4:
+    x = sorted(pd4); y = [pd4[s] for s in x]
+    plt.plot(x,y,'-o',label="Case 4")
+plt.xlabel("SNR (dB)"); plt.ylabel("Probability of Detection (PD) @ PFA 5%")
+plt.title("PD vs SNR"); plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
+plt.figure(figsize=(7,5))
+if pd5:
+    x = sorted(pd5); y = [pd5[s] for s in x]
+    plt.plot(x,y,'-o',label="Case 5",color="purple")
+plt.xlabel("SNR (dB)"); plt.ylabel("Probability of Detection (PD) @ PFA 5%")
+plt.title("PD vs SNR"); plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
 
-print("\n===== Running Case 5: Varying Partial Observation =====")
-for snr in CASE5_SNRS:
-    path = CASE5_PATH / f"Data_SNR{snr}vol1.pth"
-    if not path.exists():
-        print(f"❌ File not found for Case 5 SNR={snr}dB")
-        continue
-    pd, fpr, tpr = train_and_evaluate("Case 5", path)
-    pd5[snr] = pd
-    fpr5[snr] = fpr
-    tpr5[snr] = tpr
-
-# === Line Plot: PD vs SNR for Case 4 ===
-plt.figure(figsize=(8, 5))
-plt.plot(sorted(pd4.keys()), [pd4[snr] for snr in sorted(pd4)], marker='o', label="Case 4")
-plt.title("Case 4: PD vs SNR @ PFA=5% (Random Modulation Types)")
-plt.xlabel("SNR (dB)")
-plt.ylabel("Probability of Detection (PD)")
-plt.grid(True)
-plt.legend()
-plt.tight_layout()
-plt.show()
-
-# === Line Plot: PD vs SNR for Case 5 ===
-plt.figure(figsize=(8, 5))
-plt.plot(sorted(pd5.keys()), [pd5[snr] for snr in sorted(pd5)], marker='o', color='purple', label="Case 5")
-plt.title("Case 5: PD vs SNR @ PFA=5% (Varying Partial Observation)")
-plt.xlabel("SNR (dB)")
-plt.ylabel("Probability of Detection (PD)")
-plt.grid(True)
-plt.legend()
-plt.tight_layout()
-plt.show()
-
-# === ROC Curve for Case 3, 4, 5 ===
-# Load Case 3 model ROC (already saved earlier)
+# ------------------------------------------------------------------------
+# --------  ROC curves @ -8 dB  ----------
+plt.figure(figsize=(7,6))
+# load Case‑3 ROC if model exists
 try:
-    model_case3 = LSTMDetector().to(DEVICE)
-    model_case3.load_state_dict(torch.load("lstm_case_3_snr-8_model.pt", map_location=DEVICE))
-    db3 = torch.load("C:/Users/Srijita Saha/Collaborative learning/PartialObservation/RefinedNewData/SNRs/10m_Alpha5/250626_17_45/Data_SNR-8vol20.pth")
-    test_loader3 = DataLoader(SyntheticPSDCaseDataset(db3['testing data list'], db3['testing label list']), batch_size=BATCH_SIZE)
-    _, fpr3, tpr3 = evaluate_pd(model_case3, test_loader3)
-except:
-    fpr3, tpr3 = None, None
-    print("⚠️ Case 3 model or data not found for ROC.")
+    model3 = LSTMDetector().to(DEVICE)
+    model3.load_state_dict(torch.load("lstm_case3_snr-8_model.pt",map_location=DEVICE))
+    db3 = torch.load(r"C:\Users\Srijita Saha\Collaborative learning\PartialObservation\RefinedNewData\SNRs\10m_Alpha5\250708_18_30\Data_SNR-8vol20.pth")
+    tl3 = DataLoader(SyntheticPSDCaseDataset(db3['testing data list'], db3['testing label list']), batch_size=BATCH_SIZE)
+    _, fpr3, tpr3 = evaluate_pd(model3, tl3)
+    plt.plot(fpr3, tpr3, '--', label="Case 3 (SNR -8 dB)", color="green")
+except Exception as e:
+    print("⚠️ Case 3 ROC skipped:", e)
 
-plt.figure(figsize=(8, 6))
-if fpr3 is not None: plt.plot(fpr3, tpr3, label="Case 3 (SNR=-8dB)", linestyle="--", color="green")
-plt.plot(fpr4, tpr4, label="Case 4 (SNR=-8dB)", linestyle="-", color="orange")
-plt.plot(fpr5, tpr5, label="Case 5 (SNR=-8dB)", linestyle="-", color="purple")
-plt.title("ROC Curves for Case 3, 4, 5 @ SNR=-8dB")
+if -8 in fpr4:
+    plt.plot(fpr4[-8], tpr4[-8], '-', label="Case 4 (SNR -8 dB)", color="orange")
+if -8 in fpr5:
+    plt.plot(fpr5[-8], tpr5[-8], '-', label="Case 5 (SNR -8 dB)", color="purple")
+
 plt.xlabel("Probability of False Alarm (PFA)")
 plt.ylabel("Probability of Detection (PD)")
-plt.grid(True)
-plt.legend()
-plt.tight_layout()
-plt.show()
+plt.title("ROC Curves @ SNR = -8 dB")
+plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
